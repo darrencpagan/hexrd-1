@@ -16,6 +16,7 @@ import contextlib
 import multiprocessing
 import tempfile
 import shutil
+import socket
 
 # import of hexrd modules
 import hexrd
@@ -29,7 +30,21 @@ from hexrd import xrdutil
 
 from skimage.morphology import dilation as ski_dilation
 
-from progressbar import ProgressBar, Percentage, Bar
+hostname = socket.gethostname()
+
+USE_MPI = False
+rank = 0
+try:
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    world_size = comm.Get_size()
+    rank = comm.Get_rank()
+    USE_MPI = world_size > 1
+    logging.info(f'{rank=} {world_size=} {hostname=}')
+except ImportError:
+    logging.warning(f'mpi4py failed to load on {hostname=}. MPI is disabled.')
+    pass
+
 
 beam = constants.beam_vec
 Z_l = constants.lab_z
@@ -41,7 +56,7 @@ vInv_ref = constants.identity_6x1
 # ==============================================================================
 
 
-class ProcessController(object):
+class ProcessController:
     """This is a 'controller' that provides the necessary hooks to
     track the results of the process as well as to provide clues of
     the progress of the process"""
@@ -107,7 +122,7 @@ class ProcessController(object):
 
 
 def null_progress_observer():
-    class NullProgressObserver(object):
+    class NullProgressObserver:
         def start(self, name, count):
             pass
 
@@ -122,8 +137,10 @@ def null_progress_observer():
 
 def progressbar_progress_observer():
 
-    class ProgressBarProgressObserver(object):
+    class ProgressBarProgressObserver:
         def start(self, name, count):
+            from progressbar import ProgressBar, Percentage, Bar
+
             self.pbar = ProgressBar(widgets=[name, Percentage(), Bar()],
                                     maxval=count)
             self.pbar.start()
@@ -138,7 +155,7 @@ def progressbar_progress_observer():
 
 
 def forgetful_result_handler():
-    class ForgetfulResultHandler(object):
+    class ForgetfulResultHandler:
         def handle_result(self, key, value):
             pass  # do nothing
 
@@ -148,7 +165,7 @@ def forgetful_result_handler():
 def saving_result_handler(filename):
     """returns a result handler that saves the resulting arrays into a file
     with name filename"""
-    class SavingResultHandler(object):
+    class SavingResultHandler:
         def __init__(self, file_name):
             self.filename = file_name
             self.arrays = {}
@@ -177,7 +194,7 @@ def checking_result_handler(filename):
     match. A FULL PASS will happen when all existing results match
 
     """
-    class CheckingResultHandler(object):
+    class CheckingResultHandler:
         def __init__(self, reference_file):
             """Checks the result against those save in 'reference_file'"""
             logging.info("Loading reference results from '%s'", reference_file)
@@ -374,12 +391,12 @@ def mockup_experiment():
 # =============================================================================
 
 # Some basic 3d algebra =======================================================
-@numba.njit
+@numba.njit(nogil=True, cache=True)
 def _v3_dot(a, b):
     return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
 
 
-@numba.njit
+@numba.njit(nogil=True, cache=True)
 def _m33_v3_multiply(m, v, dst):
     v0 = v[0]
     v1 = v[1]
@@ -391,7 +408,7 @@ def _m33_v3_multiply(m, v, dst):
     return dst
 
 
-@numba.njit
+@numba.njit(nogil=True, cache=True)
 def _v3_normalized(src, dst):
     v0 = src[0]
     v1 = src[1]
@@ -406,7 +423,7 @@ def _v3_normalized(src, dst):
     return dst
 
 
-@numba.njit
+@numba.njit(nogil=True, cache=True)
 def _make_binary_rot_mat(src, dst):
     v0 = src[0]
     v1 = src[1]
@@ -429,7 +446,7 @@ def _make_binary_rot_mat(src, dst):
 
 # This is equivalent to the transform module anglesToGVec, but written in
 # numba. This should end in a module to share with other scripts
-@numba.njit
+@numba.njit(nogil=True, cache=True)
 def _anglesToGVec(angs, rMat_ss, rMat_c):
     """From a set of angles return them in crystal space"""
     result = np.empty_like(angs)
@@ -471,7 +488,7 @@ def _anglesToGVec(angs, rMat_ss, rMat_c):
 # gvec_cs, rSm varies per grain
 #
 # gvec_cs
-@numba.jit()
+@numba.njit(nogil=True, cache=True)
 def _gvec_to_detector_array(vG_sn, rD, rSn, rC, tD, tS, tC):
     """ beamVec is the beam vector: (0, 0, -1) in this case """
     ztol = xrdutil.epsf
@@ -523,7 +540,7 @@ def _gvec_to_detector_array(vG_sn, rD, rSn, rC, tD, tS, tC):
     return result
 
 
-@numba.njit
+@numba.njit(nogil=True, cache=True)
 def _quant_and_clip_confidence(coords, angles, image,
                                base, inv_deltas, clip_vals):
     """quantize and clip the parametric coordinates in coords + angles
@@ -657,7 +674,7 @@ def simulate_diffractions(grain_params, experiment, controller):
 #       booleans, an array of uint8 could be used so the image is stored
 #       with a bit per pixel.
 
-@numba.njit
+@numba.njit(nogil=True, cache=True)
 def _write_pixels(coords, angles, image, base, inv_deltas, clip_vals):
     count = len(coords)
     for i in range(count):
@@ -677,6 +694,41 @@ def _write_pixels(coords, angles, image, base, inv_deltas, clip_vals):
         x_off = 7 - (x % 8)
         image[z, y, x_byte] |= (1 << x_off)
 
+def get_offset_size(n_coords):
+    offset = 0
+    size = n_coords
+    if USE_MPI:
+        coords_per_rank = n_coords // world_size
+        offset = rank * coords_per_rank
+
+        size = coords_per_rank
+        if rank == world_size - 1:
+            size = n_coords - offset
+
+    return (offset, size)
+
+def gather_confidence(controller, confidence, n_grains, n_coords):
+    if rank == 0:
+        global_confidence = np.empty(n_grains * n_coords, dtype=np.float64)
+    else:
+        global_confidence = None
+
+    # Calculate the send buffer sizes
+    coords_per_rank = n_coords // world_size
+    send_counts = np.full(world_size, coords_per_rank * n_grains)
+    send_counts[-1] = (n_coords - (coords_per_rank * (world_size-1))) * n_grains
+
+    if rank == 0:
+        # Time how long it takes to perform the MPI gather
+        controller.start('gather_confidence', 1)
+
+    # Transpose so the data will be more easily re-shaped into its final shape
+    # Must be flattened as well so the underlying data is modified...
+    comm.Gatherv(confidence.T.flatten(), (global_confidence, send_counts), root=0)
+    if rank == 0:
+        controller.finish('gather_confidence')
+        confidence = global_confidence.reshape(n_coords, n_grains).T
+        controller.handle_result("confidence", confidence)
 
 # ==============================================================================
 # %% ORIENTATION TESTING
@@ -745,18 +797,24 @@ def test_orientations(image_stack, experiment, controller):
         precomp.append((gvec_cs, rmat_ss))
     controller.finish(subprocess)
 
+    # Divide coords by ranks
+    (offset, size) = get_offset_size(n_coords)
+
     # grand loop ==============================================================
     # The near field simulation 'grand loop'. Where the bulk of computing is
     # performed. We are looking for a confidence matrix that has a n_grains
-    chunks = range(0, n_coords, chunk_size)
+    chunks = range(offset, offset+size, chunk_size)
+
     subprocess = 'grand_loop'
     controller.start(subprocess, n_coords)
     finished = 0
     ncpus = min(ncpus, len(chunks))
 
+    logging.info(f'For {rank=}, {offset=}, {size=}, {chunks=}, {len(chunks)=}, {ncpus=}')
+
     logging.info('Checking confidence for %d coords, %d grains.',
                  n_coords, n_grains)
-    confidence = np.empty((n_grains, n_coords))
+    confidence = np.empty((n_grains, size))
     if ncpus > 1:
         global _multiprocessing_start_method
         logging.info('Running multiprocess %d processes (%s)',
@@ -769,6 +827,8 @@ def test_orientations(image_stack, experiment, controller):
             for rslice, rvalues in pool.imap_unordered(multiproc_inner_loop,
                                                        chunks):
                 count = rvalues.shape[1]
+                # We need to adjust this slice for the offset
+                rslice = slice(rslice.start - offset, rslice.stop - offset)
                 confidence[:, rslice] = rvalues
                 finished += count
                 controller.update(finished)
@@ -783,12 +843,19 @@ def test_orientations(image_stack, experiment, controller):
                 stop=chunk_stop
             )
             count = rvalues.shape[1]
+            # We need to adjust this slice for the offset
+            rslice = slice(rslice.start - offset, rslice.stop - offset)
             confidence[:, rslice] = rvalues
             finished += count
             controller.update(finished)
 
     controller.finish(subprocess)
-    controller.handle_result("confidence", confidence)
+
+    # Now gather result to rank 0
+    if USE_MPI:
+        gather_confidence(controller, confidence, n_grains, n_coords)
+    else:
+        controller.handle_result("confidence", confidence)
 
 
 def evaluate_diffraction_angles(experiment, controller=None):
@@ -948,7 +1015,10 @@ def multiproc_inner_loop(chunk):
 
     chunk_size = _mp_state[0]
     n_coords = len(_mp_state[4])
-    chunk_stop = min(n_coords, chunk+chunk_size)
+
+    (offset, size) = get_offset_size(n_coords)
+
+    chunk_stop = min(offset+size, chunk+chunk_size)
     return _grand_loop_inner(*_mp_state[1:], start=chunk, stop=chunk_stop)
 
 
@@ -1079,7 +1149,11 @@ def build_controller(args):
     # builds the controller to use based on the args
 
     # result handle
-    progress_handler = progressbar_progress_observer()
+    try:
+        import progressbar
+        progress_handler = progressbar_progress_observer()
+    except ImportError:
+        progress_handler = null_progress_observer()
 
     if args.check is not None:
         if args.generate is not None:
@@ -1112,9 +1186,15 @@ def build_controller(args):
 _multiprocessing_start_method = 'fork' if hasattr(os, 'fork') else 'spawn'
 
 if __name__ == '__main__':
+    LOG_LEVEL = logging.INFO
     FORMAT="%(relativeCreated)12d [%(process)6d/%(thread)6d] %(levelname)8s: %(message)s"
-    logging.basicConfig(level=logging.INFO,
-                        format=FORMAT)
+
+    logging.basicConfig(level=LOG_LEVEL, format=FORMAT)
+
+    # Setting the root log level via logging.basicConfig() doesn't always work.
+    # The next line ensures that it will get set.
+    logging.getLogger().setLevel(LOG_LEVEL)
+
     args = parse_args()
 
     if len(args.inst_profile) > 0:
